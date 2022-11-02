@@ -7,7 +7,7 @@ module Auth0
     # here's the proxy for Rest calls based on rest-client, we're building all request on that gem
     # for now, if you want to feel free to use your own http client
     module HTTPProxy
-      attr_accessor :headers, :base_uri, :timeout, :retry_count
+      attr_accessor :headers, :base_uri, :timeout, :retry_count, :rate_limits
       DEFAULT_RETRIES = 3
       MAX_ALLOWED_RETRIES = 10
       MAX_REQUEST_RETRY_JITTER = 250
@@ -18,6 +18,8 @@ module Auth0
       # proxying requests from instance methods to HTTP class methods
       %i(get post post_file put patch delete delete_with_body).each do |method|
         define_method(method) do |uri, body = {}, extra_headers = {}|
+          self.rate_limits ||= Hash.new {|h,k| h[k] = {remaining: 1} }
+          
           body = body.delete_if { |_, v| v.nil? }
           token = get_token()
           authorization_header(token) unless token.nil?
@@ -72,6 +74,11 @@ module Auth0
       end
 
       def request(method, uri, body = {}, extra_headers = {})
+        rate_limit = rate_limits["#{method} #{uri}"]
+        if rate_limit[:remaining] <= 0 && Time.current.to_i > rate_limit[:reset]
+          sleep(rate_limit[:reset] - Time.current.to_i + 1)
+        end
+
         result = if method == :get
           @headers ||= {}
           get_headers = @headers.merge({params: body}).merge(extra_headers)
@@ -91,6 +98,12 @@ module Auth0
         else
           call(method, encode_uri(uri), timeout, headers, body.to_json)
         end
+      
+        rate_limit.replace({
+          remaining: result.headers[:x_ratelimit_remaining].to_i,
+          limit: result.headers[:x_ratelimit_limit].to_i,
+          reset: result.headers[:x_ratelimit_reset].to_i,
+        }) if result[:x_ratelimit_limit]
 
         case result.code
         when 200...226 then safe_parse_json(result.body)
